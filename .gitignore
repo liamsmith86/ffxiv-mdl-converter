@@ -1,0 +1,6 @@
+/target/
+/tests/fixtures/
+*.db
+*.mdl
+*.log
+.DS_Store
