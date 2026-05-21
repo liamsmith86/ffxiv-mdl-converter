@@ -1,6 +1,6 @@
 [package]
 name = "ffxiv_mdl_converter"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "Standalone GPL FFXIV MDL <-> TexTools DB converter"

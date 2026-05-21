@@ -44,6 +44,7 @@ pub struct ModelData {
     pub material_count: u16,
     pub bone_count: u16,
     pub bone_table_count: u16,
+    pub bone_set_size: u16,
     pub shape_count: u16,
     pub shape_mesh_count: u16,
     pub shape_value_count: u16,
@@ -481,7 +482,7 @@ fn read_model_data(cursor: &mut Cursor<&[u8]>, header: &ModelFileHeader) -> Resu
     let bg_change_material_index = cursor.read_u8()?;
     let bg_crest_change_material_index = cursor.read_u8()?;
     let neck_morph_table_size = cursor.read_u8()?;
-    let _bone_set_size = cursor.read_u16::<LittleEndian>()?;
+    let bone_set_size = cursor.read_u16::<LittleEndian>()?;
     let unknown13 = cursor.read_u16::<LittleEndian>()?;
     let patch_72_table_size = cursor.read_u16::<LittleEndian>()?;
     let unknown15 = cursor.read_u16::<LittleEndian>()?;
@@ -518,7 +519,7 @@ fn read_model_data(cursor: &mut Cursor<&[u8]>, header: &ModelFileHeader) -> Resu
         read_bytes(cursor, terrain_shadow_submesh_count as usize * 12)?;
     let material_name_offsets = read_u32_vec(cursor, material_count as usize)?;
     let bone_name_offsets = read_u32_vec(cursor, bone_count as usize)?;
-    let bone_tables = read_bone_tables(cursor, header.version, bone_table_count)?;
+    let bone_tables = read_bone_tables(cursor, header.version, bone_table_count, bone_set_size)?;
 
     let mut shapes = Vec::with_capacity(shape_count as usize);
     for _ in 0..shape_count {
@@ -556,6 +557,7 @@ fn read_model_data(cursor: &mut Cursor<&[u8]>, header: &ModelFileHeader) -> Resu
         material_count,
         bone_count,
         bone_table_count,
+        bone_set_size,
         shape_count,
         shape_mesh_count,
         shape_value_count,
@@ -716,7 +718,12 @@ fn read_submesh(cursor: &mut Cursor<&[u8]>) -> Result<Submesh> {
     })
 }
 
-fn read_bone_tables(cursor: &mut Cursor<&[u8]>, version: u32, count: u16) -> Result<Vec<Vec<u16>>> {
+fn read_bone_tables(
+    cursor: &mut Cursor<&[u8]>,
+    version: u32,
+    count: u16,
+    bone_set_size: u16,
+) -> Result<Vec<Vec<u16>>> {
     let mut tables = Vec::with_capacity(count as usize);
     if version <= 0x0100_0005 {
         for _ in 0..count {
@@ -730,6 +737,8 @@ fn read_bone_tables(cursor: &mut Cursor<&[u8]>, version: u32, count: u16) -> Res
             tables.push(values);
         }
     } else {
+        let block_start = cursor.stream_position()?;
+        let block_end = block_start + count as u64 * 4 + bone_set_size as u64 * 2;
         let mut offset_counts = Vec::with_capacity(count as usize);
         for _ in 0..count {
             let offset = cursor.read_u16::<LittleEndian>()?;
@@ -743,6 +752,16 @@ fn read_bone_tables(cursor: &mut Cursor<&[u8]>, version: u32, count: u16) -> Res
             }
             tables.push(values);
             pad_to_4(cursor)?;
+        }
+
+        // Version 6 bone-set blocks reserve the full byte range declared by
+        // BoneSetSize, even when the counted bone indices only occupy part of
+        // it. ConsoleTools advances to the declared block end before reading
+        // shapes/part-bone data; doing the same keeps later reads aligned for
+        // mods that preserve extra bone-set capacity.
+        let current_position = cursor.stream_position()?;
+        if current_position < block_end {
+            cursor.seek(SeekFrom::Start(block_end))?;
         }
     }
     Ok(tables)
