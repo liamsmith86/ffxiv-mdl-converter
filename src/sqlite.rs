@@ -81,6 +81,19 @@ CREATE TABLE "shape_vertices" (
     "position_z" REAL NOT NULL,
     PRIMARY KEY("shape", "mesh", "part", "vertex_id")
 );
+CREATE TABLE "shape_values" (
+    "shape" TEXT NOT NULL,
+    "mesh" INTEGER NOT NULL,
+    "part" INTEGER NOT NULL,
+    "shape_value_index" INTEGER NOT NULL,
+    "base_indices_index" INTEGER NOT NULL,
+    "replacing_vertex_index" INTEGER NOT NULL,
+    "vertex_id" INTEGER NOT NULL,
+    "position_x" REAL NOT NULL,
+    "position_y" REAL NOT NULL,
+    "position_z" REAL NOT NULL,
+    PRIMARY KEY("shape", "mesh", "part", "shape_value_index")
+);
 CREATE TABLE "models" (
     "model" INTEGER NOT NULL,
     "name" TEXT,
@@ -414,9 +427,16 @@ fn insert_shape_vertices(
     mesh: &DecodedMesh,
     parts: &[MeshPartExport],
 ) -> Result<()> {
-    let mut stmt = conn.prepare(
+    let mut vertex_stmt = conn.prepare(
         "INSERT OR REPLACE INTO shape_vertices (shape, mesh, part, vertex_id, position_x, position_y, position_z)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    let mut value_stmt = conn.prepare(
+        "INSERT OR REPLACE INTO shape_values (
+            shape, mesh, part, shape_value_index, base_indices_index, replacing_vertex_index,
+            vertex_id, position_x, position_y, position_z
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )?;
     for shape in &model.data.shapes {
         let shape_name = model.data.shape_name(shape);
@@ -431,12 +451,13 @@ fn insert_shape_vertices(
             }
             let value_start = shape_mesh.shape_value_offset as usize;
             let value_count = shape_mesh.shape_value_count as usize;
-            for value in model
+            for (relative_value_index, value) in model
                 .data
                 .shape_values
                 .iter()
                 .skip(value_start)
                 .take(value_count)
+                .enumerate()
             {
                 let absolute_index_position = value
                     .base_indices_index
@@ -461,26 +482,53 @@ fn insert_shape_vertices(
                 else {
                     continue;
                 };
-                for part in parts {
-                    let Some(part_vertex_id) =
-                        part.original_to_part_vertex.get(&original_vertex_id)
-                    else {
-                        continue;
-                    };
-                    stmt.execute(params![
-                        shape_name,
-                        mesh_id as i64,
-                        part.part_index as i64,
-                        *part_vertex_id as i64,
-                        replacement.position[0],
-                        replacement.position[1],
-                        replacement.position[2],
-                    ])?;
-                }
+                let Some(part) =
+                    part_for_index_position(parts, mesh.mesh.start_index, index_position)
+                else {
+                    continue;
+                };
+                let Some(part_vertex_id) = part.original_to_part_vertex.get(&original_vertex_id)
+                else {
+                    continue;
+                };
+                vertex_stmt.execute(params![
+                    shape_name,
+                    mesh_id as i64,
+                    part.part_index as i64,
+                    *part_vertex_id as i64,
+                    replacement.position[0],
+                    replacement.position[1],
+                    replacement.position[2],
+                ])?;
+                value_stmt.execute(params![
+                    shape_name,
+                    mesh_id as i64,
+                    part.part_index as i64,
+                    value_start as i64 + relative_value_index as i64,
+                    value.base_indices_index as i64,
+                    value.replacing_vertex_index as i64,
+                    *part_vertex_id as i64,
+                    replacement.position[0],
+                    replacement.position[1],
+                    replacement.position[2],
+                ])?;
             }
         }
     }
     Ok(())
+}
+
+fn part_for_index_position<'a>(
+    parts: &'a [MeshPartExport],
+    mesh_start_index: u32,
+    index_position: usize,
+) -> Option<&'a MeshPartExport> {
+    let absolute_index_position = mesh_start_index as usize + index_position;
+    parts.iter().find(|part| {
+        let start = part.submesh.index_offset as usize;
+        let end = start + part.submesh.index_count as usize;
+        absolute_index_position >= start && absolute_index_position < end
+    })
 }
 
 fn material_stem(path: &str) -> String {
