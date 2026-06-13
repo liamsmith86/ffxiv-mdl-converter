@@ -465,6 +465,12 @@ fn apply_wrap_options(
     if options.copy_materials {
         copy_base_materials(model, base);
     }
+    // ConsoleTools /wrap emits a canonical material table: normalized paths,
+    // raw lexicographic order, and duplicate paths collapsed with mesh indices
+    // remapped to the surviving material. Keeping the same invariant avoids
+    // game-side material/dye resolver mismatches on mods with many material
+    // swaps targeting the same model.
+    sort_and_dedupe_materials(model);
     if options.copy_attributes {
         copy_base_attributes(model, base);
     }
@@ -510,6 +516,32 @@ fn get_or_insert_material(
     materials.push(normalized.clone());
     material_ids.insert(normalized, index);
     index
+}
+
+fn sort_and_dedupe_materials(model: &mut ImportModel) {
+    let original_materials = model.materials.clone();
+    let mut sorted_materials = original_materials
+        .iter()
+        .map(|material| normalize_material_path(material))
+        .collect::<Vec<_>>();
+    sorted_materials.sort();
+    sorted_materials.dedup();
+
+    let material_ids = sorted_materials
+        .iter()
+        .enumerate()
+        .map(|(index, material)| (material.clone(), index))
+        .collect::<HashMap<_, _>>();
+
+    for mesh in &mut model.meshes {
+        let material = original_materials
+            .get(mesh.material_id)
+            .map(|material| normalize_material_path(material))
+            .unwrap_or_else(|| "/mt_c0001b0001_a.mtrl".to_string());
+        mesh.material_id = material_ids.get(&material).copied().unwrap_or(0);
+    }
+
+    model.materials = sorted_materials;
 }
 
 fn copy_base_attributes(model: &mut ImportModel, base: &ModelFile) {
@@ -2181,6 +2213,21 @@ fn write_vertex_element(
 }
 
 fn build_vertex_layouts(model: &ImportModel, base: &ModelFile) -> Result<Vec<VertexLayout>> {
+    // Appended meshes do not have a one-to-one base mesh declaration. Prefer a
+    // compatible declaration from the target MDL before synthesizing a minimal
+    // layout, matching ConsoleTools and preserving target-specific UV/color
+    // channels that material shaders may depend on.
+    let base_layouts = base
+        .lod0_meshes
+        .iter()
+        .filter_map(|base_mesh| {
+            base.data
+                .vertex_declarations
+                .get(base_mesh.original_mesh_index)
+                .and_then(vertex_layout_from_mdl)
+        })
+        .collect::<Vec<_>>();
+
     let mut layouts = Vec::with_capacity(model.meshes.len());
     for (mesh_index, mesh) in model.meshes.iter().enumerate() {
         let mesh_usage = usage_for_mesh(mesh);
@@ -2196,7 +2243,13 @@ fn build_vertex_layouts(model: &ImportModel, base: &ModelFile) -> Result<Vec<Ver
                 vertex_layout_from_mdl(declaration)
                     .filter(|layout| layout_supports_usage(layout, mesh_usage))
             });
-        layouts.push(base_layout.unwrap_or_else(|| build_vertex_layout(mesh_usage)));
+        let compatible_base_layout = base_layout.or_else(|| {
+            base_layouts
+                .iter()
+                .find(|layout| layout_supports_usage(layout, mesh_usage))
+                .cloned()
+        });
+        layouts.push(compatible_base_layout.unwrap_or_else(|| build_vertex_layout(mesh_usage)));
     }
     Ok(layouts)
 }
