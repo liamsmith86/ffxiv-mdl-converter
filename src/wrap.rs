@@ -72,6 +72,7 @@ struct ImportMesh {
     base_vertex_count: usize,
     total_vertex_count: usize,
     index_count: usize,
+    shape_replacement_vertices: BTreeMap<usize, ImportVertex>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,11 +82,21 @@ struct ImportPart {
     vertices: Vec<ImportVertex>,
     indices: Vec<u32>,
     shape_vertices: BTreeMap<String, Vec<ShapeVertex>>,
+    shape_values: BTreeMap<String, Vec<ShapeValueImport>>,
     vertex_start: usize,
 }
 
 #[derive(Debug, Clone)]
 struct ShapeVertex {
+    vertex_id: usize,
+    position: [f32; 3],
+}
+
+#[derive(Debug, Clone)]
+struct ShapeValueImport {
+    shape_value_index: usize,
+    base_indices_index: usize,
+    replacing_vertex_index: usize,
     vertex_id: usize,
     position: [f32; 3],
 }
@@ -429,6 +440,7 @@ fn load_import_db(path: &Path, shift_import_uv: bool, clone_uv2: bool) -> Result
             )?;
             part.indices = load_indices(&conn, mesh.mesh_id, part.part_id)?;
             part.shape_vertices = load_shape_vertices(&conn, mesh.mesh_id, part.part_id)?;
+            part.shape_values = load_shape_values(&conn, mesh.mesh_id, part.part_id)?;
         }
     }
 
@@ -453,6 +465,12 @@ fn apply_wrap_options(
     if options.copy_materials {
         copy_base_materials(model, base);
     }
+    // ConsoleTools /wrap emits a canonical material table: normalized paths,
+    // raw lexicographic order, and duplicate paths collapsed with mesh indices
+    // remapped to the surviving material. Keeping the same invariant avoids
+    // game-side material/dye resolver mismatches on mods with many material
+    // swaps targeting the same model.
+    sort_and_dedupe_materials(model);
     if options.copy_attributes {
         copy_base_attributes(model, base);
     }
@@ -498,6 +516,32 @@ fn get_or_insert_material(
     materials.push(normalized.clone());
     material_ids.insert(normalized, index);
     index
+}
+
+fn sort_and_dedupe_materials(model: &mut ImportModel) {
+    let original_materials = model.materials.clone();
+    let mut sorted_materials = original_materials
+        .iter()
+        .map(|material| normalize_material_path(material))
+        .collect::<Vec<_>>();
+    sorted_materials.sort();
+    sorted_materials.dedup();
+
+    let material_ids = sorted_materials
+        .iter()
+        .enumerate()
+        .map(|(index, material)| (material.clone(), index))
+        .collect::<HashMap<_, _>>();
+
+    for mesh in &mut model.meshes {
+        let material = original_materials
+            .get(mesh.material_id)
+            .map(|material| normalize_material_path(material))
+            .unwrap_or_else(|| "/mt_c0001b0001_a.mtrl".to_string());
+        mesh.material_id = material_ids.get(&material).copied().unwrap_or(0);
+    }
+
+    model.materials = sorted_materials;
 }
 
 fn copy_base_attributes(model: &mut ImportModel, base: &ModelFile) {
@@ -683,6 +727,13 @@ fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
         .map_err(Into::into)
 }
 
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let mut stmt =
+        conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1")?;
+    let mut rows = stmt.query([table])?;
+    Ok(rows.next()?.is_some())
+}
+
 fn load_materials(conn: &Connection) -> Result<Vec<String>> {
     let mut stmt = conn.prepare("SELECT material_id, name FROM materials ORDER BY material_id")?;
     let rows = stmt.query_map([], |row| {
@@ -737,6 +788,7 @@ fn load_meshes(conn: &Connection, materials: &[String]) -> Result<Vec<ImportMesh
             base_vertex_count: 0,
             total_vertex_count: 0,
             index_count: 0,
+            shape_replacement_vertices: BTreeMap::new(),
         });
     }
     if meshes.is_empty() {
@@ -781,6 +833,7 @@ fn load_parts(conn: &Connection, mesh_id: i64) -> Result<Vec<ImportPart>> {
             vertices: Vec::new(),
             indices: Vec::new(),
             shape_vertices: BTreeMap::new(),
+            shape_values: BTreeMap::new(),
             vertex_start: 0,
         });
     }
@@ -791,6 +844,7 @@ fn load_parts(conn: &Connection, mesh_id: i64) -> Result<Vec<ImportPart>> {
             vertices: Vec::new(),
             indices: Vec::new(),
             shape_vertices: BTreeMap::new(),
+            shape_values: BTreeMap::new(),
             vertex_start: 0,
         });
     }
@@ -951,6 +1005,46 @@ fn load_shape_vertices(
     Ok(out)
 }
 
+fn load_shape_values(
+    conn: &Connection,
+    mesh_id: i64,
+    part_id: i64,
+) -> Result<BTreeMap<String, Vec<ShapeValueImport>>> {
+    if !table_exists(conn, "shape_values")? {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT shape, shape_value_index, base_indices_index, replacing_vertex_index,
+                vertex_id, position_x, position_y, position_z
+         FROM shape_values
+         WHERE mesh = ?1 AND part = ?2
+         ORDER BY shape, shape_value_index",
+    )?;
+    let rows = stmt.query_map((mesh_id, part_id), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            ShapeValueImport {
+                shape_value_index: row.get::<_, i64>(1)?.max(0) as usize,
+                base_indices_index: row.get::<_, i64>(2)?.max(0) as usize,
+                replacing_vertex_index: row.get::<_, i64>(3)?.max(0) as usize,
+                vertex_id: row.get::<_, i64>(4)?.max(0) as usize,
+                position: [
+                    row.get::<_, f64>(5)? as f32,
+                    row.get::<_, f64>(6)? as f32,
+                    row.get::<_, f64>(7)? as f32,
+                ],
+            },
+        ))
+    })?;
+    let mut out: BTreeMap<String, Vec<ShapeValueImport>> = BTreeMap::new();
+    for row in rows {
+        let (shape, value) = row?;
+        out.entry(shape).or_default().push(value);
+    }
+    Ok(out)
+}
+
 fn compile_model_metadata(model: &mut ImportModel) -> Result<()> {
     let mut attributes = Vec::<String>::new();
     let mut attr_ids = HashMap::<String, usize>::new();
@@ -1042,37 +1136,16 @@ fn compile_shape_parts(model: &mut ImportModel) -> Result<()> {
     let shape_names = model.shape_names.clone();
     let mut compiled = Vec::new();
     let mut value_count = 0usize;
+    for mesh in &mut model.meshes {
+        mesh.shape_replacement_vertices.clear();
+    }
     for shape in &shape_names {
         for (mesh_index, mesh) in model.meshes.iter_mut().enumerate() {
-            let mut replacements = Vec::new();
-            let mut next_shape_vertex = mesh.base_vertex_count;
-            for part in &mesh.parts {
-                let Some(shape_vertices) = part.shape_vertices.get(shape) else {
-                    continue;
-                };
-                let mut replacement_by_base = HashMap::new();
-                for shape_vertex in shape_vertices {
-                    if shape_vertex.vertex_id >= part.vertices.len() {
-                        continue;
-                    }
-                    let replacement_index = next_shape_vertex;
-                    next_shape_vertex += 1;
-                    replacement_by_base.insert(
-                        part.vertex_start + shape_vertex.vertex_id,
-                        replacement_index,
-                    );
-                }
-                if replacement_by_base.is_empty() {
-                    continue;
-                }
-                for index in &part.indices {
-                    let base_vertex = part.vertex_start + *index as usize;
-                    if let Some(replacement_vertex) = replacement_by_base.get(&base_vertex) {
-                        let mesh_index_position = mesh_index_position_for_part(mesh, part, index)?;
-                        replacements.push((mesh_index_position, *replacement_vertex));
-                    }
-                }
-            }
+            let replacements = if mesh_has_preserved_shape_values(mesh, shape) {
+                compile_preserved_shape_values(mesh, shape)?
+            } else {
+                compile_shape_values_from_vertices(mesh, shape)?
+            };
             if !replacements.is_empty() {
                 value_count += replacements.len();
                 compiled.push(CompiledShapePart {
@@ -1081,7 +1154,12 @@ fn compile_shape_parts(model: &mut ImportModel) -> Result<()> {
                     replacements,
                 });
             }
-            mesh.total_vertex_count = next_shape_vertex;
+            mesh.total_vertex_count = mesh
+                .shape_replacement_vertices
+                .keys()
+                .next_back()
+                .map(|index| index + 1)
+                .unwrap_or(mesh.base_vertex_count);
         }
     }
     for mesh in &mut model.meshes {
@@ -1092,6 +1170,101 @@ fn compile_shape_parts(model: &mut ImportModel) -> Result<()> {
     model.shape_parts = compiled;
     model.shape_value_count = value_count;
     Ok(())
+}
+
+fn mesh_has_preserved_shape_values(mesh: &ImportMesh, shape: &str) -> bool {
+    mesh.parts.iter().any(|part| {
+        part.shape_values
+            .get(shape)
+            .is_some_and(|values| !values.is_empty())
+    })
+}
+
+fn compile_preserved_shape_values(
+    mesh: &mut ImportMesh,
+    shape: &str,
+) -> Result<Vec<(usize, usize)>> {
+    let mut values = Vec::<(usize, usize, usize, ImportVertex)>::new();
+    for part in &mesh.parts {
+        let Some(shape_values) = part.shape_values.get(shape) else {
+            continue;
+        };
+        for value in shape_values {
+            if value.vertex_id >= part.vertices.len() {
+                continue;
+            }
+            let mut vertex = part.vertices[value.vertex_id];
+            vertex.position = value.position;
+            values.push((
+                value.shape_value_index,
+                value.base_indices_index,
+                value.replacing_vertex_index,
+                vertex,
+            ));
+        }
+    }
+    values.sort_by_key(|(shape_value_index, _, _, _)| *shape_value_index);
+
+    let mut replacements = Vec::with_capacity(values.len());
+    for (_, base_indices_index, replacing_vertex_index, vertex) in values {
+        if replacing_vertex_index < mesh.base_vertex_count {
+            bail!(
+                "shape replacement vertex {} overlaps base vertex count {}",
+                replacing_vertex_index,
+                mesh.base_vertex_count
+            );
+        }
+        mesh.shape_replacement_vertices
+            .entry(replacing_vertex_index)
+            .or_insert(vertex);
+        replacements.push((base_indices_index, replacing_vertex_index));
+    }
+    Ok(replacements)
+}
+
+fn compile_shape_values_from_vertices(
+    mesh: &mut ImportMesh,
+    shape: &str,
+) -> Result<Vec<(usize, usize)>> {
+    let mut replacements = Vec::new();
+    let mut next_shape_vertex = mesh
+        .shape_replacement_vertices
+        .keys()
+        .next_back()
+        .map(|index| index + 1)
+        .unwrap_or(mesh.base_vertex_count);
+    for part in &mesh.parts {
+        let Some(shape_vertices) = part.shape_vertices.get(shape) else {
+            continue;
+        };
+        let mut replacement_by_base = HashMap::new();
+        for shape_vertex in shape_vertices {
+            if shape_vertex.vertex_id >= part.vertices.len() {
+                continue;
+            }
+            let replacement_index = next_shape_vertex;
+            next_shape_vertex += 1;
+            let mut vertex = part.vertices[shape_vertex.vertex_id];
+            vertex.position = shape_vertex.position;
+            mesh.shape_replacement_vertices
+                .insert(replacement_index, vertex);
+            replacement_by_base.insert(
+                part.vertex_start + shape_vertex.vertex_id,
+                replacement_index,
+            );
+        }
+        if replacement_by_base.is_empty() {
+            continue;
+        }
+        for index in &part.indices {
+            let base_vertex = part.vertex_start + *index as usize;
+            if let Some(replacement_vertex) = replacement_by_base.get(&base_vertex) {
+                let mesh_index_position = mesh_index_position_for_part(mesh, part, index)?;
+                replacements.push((mesh_index_position, *replacement_vertex));
+            }
+        }
+    }
+    Ok(replacements)
 }
 
 fn mesh_index_position_for_part(
@@ -1839,18 +2012,17 @@ fn build_geometry(
                 write_vertex(&mut mesh_geometry, layout, vertex)?;
             }
         }
-        for part in &mesh.parts {
-            for shape_vertices in part.shape_vertices.values() {
-                for shape_vertex in shape_vertices {
-                    let Some(base_vertex) = part.vertices.get(shape_vertex.vertex_id).copied()
-                    else {
-                        continue;
-                    };
-                    let mut vertex = base_vertex;
-                    vertex.position = shape_vertex.position;
-                    write_vertex(&mut mesh_geometry, layout, &vertex)?;
-                }
+        for (expected_shape_vertex, (replacement_index, vertex)) in
+            (mesh.base_vertex_count..).zip(mesh.shape_replacement_vertices.iter())
+        {
+            if *replacement_index != expected_shape_vertex {
+                bail!(
+                    "shape replacement vertices for mesh {mesh_index} are not contiguous: expected {}, found {}",
+                    expected_shape_vertex,
+                    replacement_index
+                );
             }
+            write_vertex(&mut mesh_geometry, layout, vertex)?;
         }
 
         let vertex_offset0 = geometry.vertex_data0.len() as u32;
@@ -2041,6 +2213,21 @@ fn write_vertex_element(
 }
 
 fn build_vertex_layouts(model: &ImportModel, base: &ModelFile) -> Result<Vec<VertexLayout>> {
+    // Appended meshes do not have a one-to-one base mesh declaration. Prefer a
+    // compatible declaration from the target MDL before synthesizing a minimal
+    // layout, matching ConsoleTools and preserving target-specific UV/color
+    // channels that material shaders may depend on.
+    let base_layouts = base
+        .lod0_meshes
+        .iter()
+        .filter_map(|base_mesh| {
+            base.data
+                .vertex_declarations
+                .get(base_mesh.original_mesh_index)
+                .and_then(vertex_layout_from_mdl)
+        })
+        .collect::<Vec<_>>();
+
     let mut layouts = Vec::with_capacity(model.meshes.len());
     for (mesh_index, mesh) in model.meshes.iter().enumerate() {
         let mesh_usage = usage_for_mesh(mesh);
@@ -2056,7 +2243,13 @@ fn build_vertex_layouts(model: &ImportModel, base: &ModelFile) -> Result<Vec<Ver
                 vertex_layout_from_mdl(declaration)
                     .filter(|layout| layout_supports_usage(layout, mesh_usage))
             });
-        layouts.push(base_layout.unwrap_or_else(|| build_vertex_layout(mesh_usage)));
+        let compatible_base_layout = base_layout.or_else(|| {
+            base_layouts
+                .iter()
+                .find(|layout| layout_supports_usage(layout, mesh_usage))
+                .cloned()
+        });
+        layouts.push(compatible_base_layout.unwrap_or_else(|| build_vertex_layout(mesh_usage)));
     }
     Ok(layouts)
 }

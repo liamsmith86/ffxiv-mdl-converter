@@ -26,6 +26,11 @@ const EXACT_TABLES: &[&str] = &[
     "SELECT mesh, part, index_id, vertex_id FROM indices ORDER BY mesh, part, index_id",
 ];
 
+const OPTIONAL_EXACT_TABLES: &[(&str, &str)] = &[(
+    "shape_values",
+    "SELECT shape, mesh, part, shape_value_index, base_indices_index, replacing_vertex_index, vertex_id, position_x, position_y, position_z FROM shape_values ORDER BY shape, mesh, part, shape_value_index",
+)];
+
 #[test]
 fn roundtrip_fixture_when_configured() -> Result<()> {
     let Some(fixture) = Fixture::from_env()? else {
@@ -222,8 +227,25 @@ fn assert_db_equivalent(expected: &Path, actual: &Path) -> Result<()> {
             "exact table mismatch for {query}"
         );
     }
+    for (table, query) in OPTIONAL_EXACT_TABLES {
+        if table_exists(&expected, table)? && table_exists(&actual, table)? {
+            let expected_rows = query_rows_as_strings(&expected, query)?;
+            let actual_rows = query_rows_as_strings(&actual, query)?;
+            assert_eq!(
+                expected_rows, actual_rows,
+                "exact optional table mismatch for {query}"
+            );
+        }
+    }
 
     assert_vertex_positions_close(&expected, &actual)
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let mut stmt =
+        conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1")?;
+    let mut rows = stmt.query([table])?;
+    Ok(rows.next()?.is_some())
 }
 
 fn query_rows_as_strings(conn: &Connection, query: &str) -> Result<Vec<Vec<String>>> {
@@ -234,7 +256,8 @@ fn query_rows_as_strings(conn: &Connection, query: &str) -> Result<Vec<Vec<Strin
         for index in 0..column_count {
             values.push(
                 row.get::<_, String>(index)
-                    .or_else(|_| row.get::<_, i64>(index).map(|value| value.to_string()))?,
+                    .or_else(|_| row.get::<_, i64>(index).map(|value| value.to_string()))
+                    .or_else(|_| row.get::<_, f64>(index).map(|value| format!("{value:.8}")))?,
             );
         }
         Ok(values)
