@@ -2012,8 +2012,9 @@ fn build_geometry(
                 write_vertex(&mut mesh_geometry, layout, vertex)?;
             }
         }
-        let mut expected_shape_vertex = mesh.base_vertex_count;
-        for (replacement_index, vertex) in &mesh.shape_replacement_vertices {
+        for (expected_shape_vertex, (replacement_index, vertex)) in
+            (mesh.base_vertex_count..).zip(mesh.shape_replacement_vertices.iter())
+        {
             if *replacement_index != expected_shape_vertex {
                 bail!(
                     "shape replacement vertices for mesh {mesh_index} are not contiguous: expected {}, found {}",
@@ -2022,7 +2023,6 @@ fn build_geometry(
                 );
             }
             write_vertex(&mut mesh_geometry, layout, vertex)?;
-            expected_shape_vertex += 1;
         }
 
         let vertex_offset0 = geometry.vertex_data0.len() as u32;

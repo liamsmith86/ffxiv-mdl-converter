@@ -518,11 +518,11 @@ fn insert_shape_vertices(
     Ok(())
 }
 
-fn part_for_index_position<'a>(
-    parts: &'a [MeshPartExport],
+fn part_for_index_position(
+    parts: &[MeshPartExport],
     mesh_start_index: u32,
     index_position: usize,
-) -> Option<&'a MeshPartExport> {
+) -> Option<&MeshPartExport> {
     let absolute_index_position = mesh_start_index as usize + index_position;
     parts.iter().find(|part| {
         let start = part.submesh.index_offset as usize;
