@@ -1944,7 +1944,7 @@ fn remap_neck_morph_data(model: &ImportModel, base: &ModelFile) -> Vec<u8> {
     }
 
     let mut out = Vec::with_capacity(base.data.neck_morph_data.len());
-    for chunk in base.data.neck_morph_data.chunks_exact(32) {
+    for chunk in base.data.neck_morph_data.as_chunks::<32>().0 {
         out.extend_from_slice(&chunk[..28]);
         let mut remapped = Vec::<u8>::with_capacity(4);
         for (slot, base_boneset_index) in chunk[28..32].iter().copied().enumerate() {
